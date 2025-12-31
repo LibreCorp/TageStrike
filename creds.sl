@@ -1,137 +1,58 @@
-#
-# Script to build SQL query for Metasploit creds model
-#	1. Run this script
-#	2. Use the output with db.creds/db.creds2 in src/msf/DatabaseImpl.java
-#
+$cols_base = "
+    publics.username AS user,
+    privates.data AS pass,
+    privates.type AS ptype,
+    cores.id AS id,
+    cores.realm_id AS realm_id
+";
 
-# the different tables that contain origin information for our credentials
-@origin = @('metasploit_credential_origin_manuals', 
-	    'metasploit_credential_origin_imports',
-	    'metasploit_credential_origin_sessions',
-	    'metasploit_credential_origin_services',
-	    'metasploit_credential_origin_cracked_passwords');
+$q_logins = "
+SELECT 
+    $cols_base,
+    host(hosts.address) AS host,
+    services.name AS sname,
+    services.port AS port,
+    services.proto AS proto
+FROM metasploit_credential_cores AS cores
+JOIN metasploit_credential_publics AS publics ON cores.public_id = publics.id
+JOIN metasploit_credential_privates AS privates ON cores.private_id = privates.id
+JOIN metasploit_credential_logins AS logins ON logins.core_id = cores.id
+JOIN services ON logins.service_id = services.id
+JOIN hosts ON services.host_id = hosts.id
+WHERE hosts.workspace_id = \" + workspaceid + \"
+";
 
-# the tables we will be pulling data from!
-@tables = @('metasploit_credential_publics',
-	    'metasploit_credential_privates',
-	    'metasploit_credential_cores');
+$q_sessions = "
+SELECT
+    $cols_base,
+    host(hosts.address) AS host,
+    'station' AS sname,
+    sessions.port AS port,
+    'tcp' AS proto
+FROM metasploit_credential_cores AS cores
+JOIN metasploit_credential_publics AS publics ON cores.public_id = publics.id
+JOIN metasploit_credential_privates AS privates ON cores.private_id = privates.id
+JOIN metasploit_credential_origin_sessions AS orig_sess ON cores.origin_id = orig_sess.id
+JOIN sessions ON orig_sess.session_id = sessions.id
+JOIN hosts ON sessions.host_id = hosts.id
+WHERE cores.origin_type = 'Metasploit::Credential::Origin::Session'
+AND hosts.workspace_id = \" + workspaceid + \"
+";
 
-# what we want to go into each row that's returned. Goal is to stay db.creds compatible
-%keys = %(
-	user        => "metasploit_credential_publics.username",
-	pass        => "metasploit_credential_privates.data",
-	ptype       => "metasploit_credential_privates.type",
-	#realm_key   => "metasploit_credential_realms.key",
-	#realm_value => "metasploit_credential_realms.value",
-	id          => "metasploit_credential_cores.id",
-	realm_id    => "metasploit_credential_cores.realm_id");
+$q_manual = "
+SELECT
+    $cols_base,
+    NULL AS host,
+    '' AS sname,
+    0 AS port,
+    '' AS proto
+FROM metasploit_credential_cores AS cores
+JOIN metasploit_credential_publics AS publics ON cores.public_id = publics.id
+JOIN metasploit_credential_privates AS privates ON cores.private_id = privates.id
+WHERE cores.origin_type != 'Metasploit::Credential::Origin::Session'
+AND cores.id NOT IN (SELECT core_id FROM metasploit_credential_logins)
+";
 
-# 
-%withservice = %(
-	host        => "host(hosts.address)",
-	sname       => "services.name",
-	port        => "services.port",
-	proto       => "services.proto");
-
-# 
-%noservice = %(
-	host        => "''",
-	sname       => "''",
-	port        => "0",
-	proto       => "''");
-
-%withsession = %(
-	host        => "host(hosts.address)",
-	sname       => "''",
-	port        => "sessions.port",
-	proto       => "''");
-
-# map origin_type to tablename...
-%origin_types = %(
-	Metasploit::Credential::Origin::Session => "metasploit_credential_origin_sessions",
-	Metasploit::Credential::Origin::Import  => "metasploit_credential_origin_imports",
-	Metasploit::Credential::Origin::Service => "metasploit_credential_origin_services",
-	Metasploit::Credential::Origin::Manual  => "metasploit_credential_origin_manuals",
-	Metasploit::Credential::Origin::Cracked_Password => "metasploit_credential_origin_cracked_passwords");
-
-# build a list of columns
-sub columns {
-	local('$key $value @r');
-	foreach $key => $value ($1) {
-		push(@r, "$value AS $key");
-	}
-
-	foreach $key => $value ($2) {
-		push(@r, "$value AS $key");
-	}
-
-	return join(", ", @r);
-}
-
-# build a list of tables to query from
-sub tables {
-	local('@t $2');
-	@t = copy(@tables);
-	if ($2 == 1) {
-		push(@t, "hosts");
-		push(@t, "services");
-	}
-	else if ($2 == 2) {
-		push(@t, "hosts");
-		push(@t, "sessions");
-	}
-	push(@t, $1);
-	return join(", ", @t);
-}
-
-sub clauses {
-	local('@w $3');
-	push(@w, "metasploit_credential_cores.origin_id = $1 $+ .id");
-	push(@w, "metasploit_credential_cores.origin_type = ' $+ $2 $+ '");
-	push(@w, "metasploit_credential_cores.public_id = metasploit_credential_publics.id");
-	push(@w, "metasploit_credential_cores.private_id = metasploit_credential_privates.id");
-#	push(@w, "metasploit_credential_cores.realm_id = metasploit_credential_realms.id");
-
-	if ($3 == 1) {
-		push(@w, "$1 $+ .service_id = services.id");
-		push(@w, "services.host_id = hosts.id");
-		push(@w, "hosts.workspace_id = \" + workspaceid + \"");
-	}
-	else if ($3 == 2) {
-		push(@w, "$1 $+ .session_id = sessions.id");
-		push(@w, "sessions.host_id = hosts.id");
-		push(@w, "hosts.workspace_id = \" + workspaceid + \"");
-	}
-	return join(" AND ", @w);
-}
-
-#
-# build our individual queries first...
-#
-
-@queries = @();
-
-foreach $class => $table (%origin_types) {
-	# pull host information!
-	if ($table eq "metasploit_credential_origin_services") {
-		$c = columns(%keys, %withservice);
-		$t = tables($table, 1);
-		$w = clauses($table, $class, 1);
-	}
-	# pull info here too
-	else if ($table eq "metasploit_credential_origin_sessions") {
-		$c = columns(%keys, %withsession);
-		$t = tables($table, 2);
-		$w = clauses($table, $class, 2);
-	}
-	# do not pull host information
-	else {
-		$c = columns(%keys, %noservice);
-		$t = tables($table);
-		$w = clauses($table, $class);
-	}
-
-	push(@queries, "SELECT $c FROM $t WHERE $w");
-}
+@queries = @($q_logins, $q_sessions, $q_manual);
 
 println(join(" UNION ", @queries));
