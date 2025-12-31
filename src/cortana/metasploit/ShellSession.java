@@ -1,146 +1,122 @@
 package cortana.metasploit;
-
 import java.util.*;
 import java.awt.*;
 import java.awt.event.*;
-
 import msf.*;
-import java.math.*;
-import java.security.*;
-
-/* Implements a class for writing commands to a shell and firing an
-   event when the command is successfully executed (with its output) */
+import java.math.BigInteger;
+import java.security.SecureRandom;
 public class ShellSession implements Runnable {
 	protected RpcConnection connection;
 	protected RpcConnection dserver;
-	protected LinkedList    listeners = new LinkedList();
-	protected LinkedList    commands  = new LinkedList();
+	protected LinkedList<ShellCallback> listeners = new LinkedList<>();
+	protected LinkedList<Command> commands  = new LinkedList<>();
 	protected String        session;
-
+	protected long          commandTimeout; 
 	private static class Command {
 		public Object   token;
 		public String   text;
-		public long	start = System.currentTimeMillis();
+		public long	    start = System.currentTimeMillis();
 	}
-
 	public static interface ShellCallback {
 		public void commandComplete(String session, Object token, String response);
 		public void commandUpdate(String session, Object token, String response);
+		public void commandFailed(String session, Object token, Exception reason);
 	}
-
 	public void addListener(ShellCallback l) {
-		synchronized (this) {
+		synchronized (listeners) {
 			listeners.add(l);
 		}
 	}
-
-	public void fireEvent(Command command, String output, boolean done) {
-		Iterator i;
-		synchronized (this) {
-			i = new LinkedList(listeners).iterator();
-		}
-
-		while (i.hasNext()) {
-			if (done)
-				((ShellCallback)i.next()).commandComplete(session, command != null ? command.token : null, output);
-			else
-				((ShellCallback)i.next()).commandUpdate(session, command != null ? command.token : null, output);
+	protected void fireEvent(Command command, String output, boolean done) {
+		synchronized (listeners) {
+			for (ShellCallback l : listeners) {
+				if (done)
+					l.commandComplete(session, command != null ? command.token : null, output);
+				else
+					l.commandUpdate(session, command != null ? command.token : null, output);
+			}
 		}
 	}
-
+	protected void fireFailure(Command command, Exception reason) {
+		synchronized (listeners) {
+			for (ShellCallback l : listeners) {
+				l.commandFailed(session, command != null ? command.token : null, reason);
+			}
+		}
+	}
 	public ShellSession(RpcConnection connection, RpcConnection dserver, String session) {
+		this(connection, dserver, session, 90000); 
+	}
+	public ShellSession(RpcConnection connection, RpcConnection dserver, String session, long commandTimeout) {
 		this.connection = connection;
 		this.dserver    = dserver;
-		this.session = session;
+		this.session    = session;
+		this.commandTimeout = commandTimeout; 
 		new Thread(this).start();
 	}
-
-	private SecureRandom random = new SecureRandom();
-
+	private final SecureRandom random = new SecureRandom();
 	protected void processCommand(Command c) {
-		Map response = null, read = null;
 		try {
-			String marker = new BigInteger(130, random).toString(32) + "\n";
-
-			StringBuffer writeme = new StringBuffer();
-			writeme.append(c.text);
-			writeme.append("\n");
-			writeme.append("echo " + marker);
-
-			/* write our command to whateverz */
-			connection.execute("session.shell_write", new Object[] { session, writeme.toString() });
-
-			/* read until we encounter AAAAAAAAAA */
-			StringBuffer output = new StringBuffer();
-
-			/* loop forever waiting for response to come back. If session is dead
-			   then this loop will break with an exception */
+			String marker = new BigInteger(130, random).toString(32);
+			String endMarker = "\n" + marker + "\n"; 
+			String commandWithMarker = c.text + "\necho " + marker + "\n";
+			connection.execute("session.shell_write", new Object[] { session, commandWithMarker });
+			StringBuilder output = new StringBuilder();
 			long start = System.currentTimeMillis();
-			while ((System.currentTimeMillis() - start) < 60000) {
-				response = readResponse();
-				String data = (response.get("data") + "");
-
+			while ((System.currentTimeMillis() - start) < this.commandTimeout) {
+				Map response = readResponse();
+				String data = response.get("data") != null ? response.get("data").toString() : "";
 				if (data.length() > 0) {
-					if (data.endsWith(marker)) {
-						data = data.substring(0, data.length() - marker.length());
-						fireEvent(c, data, false);
-						output.append(data);
-						fireEvent(c, output.toString(), true);
-						return;
-					}
-					else {
-						fireEvent(c, data, false);
-						output.append(data);
+					output.append(data);
+					fireEvent(c, data, false); 
+					if (output.toString().endsWith(endMarker)) {
+						String finalOutput = output.substring(0, output.length() - endMarker.length());
+						fireEvent(c, finalOutput, true);
+						return; 
 					}
 				}
-
-				Thread.sleep(100);
+				Thread.sleep(150); 
 			}
-			System.err.println(session + " -> " + c.text + " (took longer than anticipated, dropping: " + (System.currentTimeMillis() - start) + ")");
+			throw new Exception("Command timed out after " + (this.commandTimeout / 1000) + " seconds.");
 		}
 		catch (Exception ex) {
-			System.err.println(session + " -> " + c.text + " ( " + response + ")");
-			ex.printStackTrace();
+			System.err.println(session + " -> command '" + c.text + "' failed: " + ex.getMessage());
+			fireFailure(c, ex); 
 		}
 	}
-
 	public void addCommand(Object token, String text) {
-		synchronized (this) {
-			if (text.trim().equals("")) {
-				return;
-			}
+		if (text == null || text.trim().isEmpty()) {
+			return; 
+		}
+		synchronized (commands) {
 			Command temp = new Command();
 			temp.token = token;
 			temp.text  = text;
 			commands.add(temp);
 		}
 	}
-
 	protected Command grabCommand() {
-		synchronized (this) {
-			return (Command)commands.pollFirst();
+		synchronized (commands) {
+			return commands.pollFirst();
 		}
 	}
-
-	/* try to acquire a lock on the shell or loop forever */
 	public void acquireLock() {
 		while (true) {
 			try {
 				Map temp = (Map)dserver.execute("armitage.lock", new Object[] { session, "Cortana" });
-				if (!temp.containsKey("error"))
-					return;
-
+				if (temp != null && !temp.containsKey("error")) {
+					return; 
+				}
 				Thread.sleep(500);
 			}
 			catch (Exception ex) {
+				System.err.println("Failed trying to acquire lock for " + session + ": " + ex.getMessage());
+				try { Thread.sleep(1000); } catch (InterruptedException ie) {}
 			}
 		}
 	}
-
-	/* keep grabbing commands, acquiring locks, until everything is executed */
 	public void run() {
 		boolean needLock = true;
-
 		while (true) {
 			try {
 				Command next = grabCommand();
@@ -149,25 +125,30 @@ public class ShellSession implements Runnable {
 						acquireLock();
 						needLock = false;
 					}
-
 					processCommand(next);
-					Thread.sleep(50);
+					Thread.sleep(50); 
 				}
 				else {
 					if (!needLock) {
 						dserver.execute("armitage.unlock", new Object[] { session });
 						needLock = true;
 					}
-					Thread.sleep(500);
+					Thread.sleep(500); 
 				}
 			}
 			catch (Exception ex) {
-				System.err.println("This session appears to be dead! " + session + ", " + ex);
-				return;
+				System.err.println("Main loop for session " + session + " had a failure: " + ex.getMessage());
+				try {
+					if (!needLock) {
+						dserver.execute("armitage.unlock", new Object[] { session });
+						needLock = true;
+					}
+					Thread.sleep(5000); 
+				} catch (Exception innerEx) {
+				}
 			}
 		}
 	}
-
 	private Map readResponse() throws Exception {
 		return (Map)(connection.execute("session.shell_read", new Object[] { session }));
 	}
